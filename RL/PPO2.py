@@ -7,9 +7,14 @@ import torch
 from Placement_Env import *
 from model import *
 from tqdm import tqdm
-
+import matplotlib
+matplotlib.use('TkAgg')
 device = torch.device('cuda') if torch.cuda.is_available() \
     else torch.device('cpu')
+
+# ----------------------------------------- #
+# 参数设置
+# ----------------------------------------- #
 
 # ----------------------------------------- #
 # 参数设置
@@ -701,5 +706,6 @@ if __name__ == '__main__':
                        net_to_comps=net_to_comps, comp_pins=comp_pins, pins=pins)
 
     train_ppo2()
+
 
 

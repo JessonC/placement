@@ -29,6 +29,8 @@ comp_shapes = [
 
 import numpy as np
 import torch
+import matplotlib
+matplotlib.use('TkAgg')
 import matplotlib.pyplot as plt
 
 
