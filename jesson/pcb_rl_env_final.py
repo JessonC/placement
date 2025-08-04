@@ -1,269 +1,217 @@
-# random_greedy_with_mask.py
-
-import random
-import numpy as np
 import json
+import numpy as np
+import cv2
 from copy import deepcopy
-import matplotlib
-matplotlib.use('TkAgg')
 import matplotlib.pyplot as plt
 
-def _safe_eval(x):
-    return eval(x) if isinstance(x, str) else x
-
-def transform_shape(pts, c_old, c_new, dθ):
-    arr = np.array(pts, float)
-    arr -= c_old
-    θ = np.deg2rad(dθ)
-    R = np.array([[np.cos(θ), -np.sin(θ)],
-                  [np.sin(θ),  np.cos(θ)]])
-    arr = arr @ R.T
-    arr += c_new
-    return arr.astype(int).tolist()
+def safe_eval(x):
+    return json.loads(x) if isinstance(x, str) else x
 
 class PCBRLEnv:
-    """
-    顺序放置环境，新增 get_action_mask 方法，保证
-    放置新器件时不与已放置器件重叠或越界。
-    """
-    def __init__(self, pcb_json_path, gamma=1.0):
-        with open(pcb_json_path, "r", encoding="utf-8") as f:
+    def __init__(self,
+                 pcb_json_path: str,
+                 gamma: float = 1.0,
+                 grid_size: int = 256,
+                 nc_weight: float = 1.0,
+                 density_weight: float = 1.0,
+                 density_grid_N: int = 16,
+                 step: int = 32):
+        with open(pcb_json_path, 'r', encoding='utf-8') as f:
             self.raw_data = json.load(f)
-        self.gamma = gamma
-        self.grid_size = 256
+
+        self.gamma          = gamma
+        self.grid_size      = grid_size
+        self.nc_weight      = nc_weight
+        self.density_weight = density_weight
+        self.density_grid_N = density_grid_N
+
+
         self.reset()
 
     def reset(self):
-        d = deepcopy(self.raw_data)
-        self.cell_list = d["cellList"]
-        self.net_list  = d["netList"]
-        self.n_dev     = len(self.cell_list)
-        self.step_idx  = 0
-        # 主芯片固定放置在 index=0
-        self._refresh_cache()
-        return self._get_state()
+        self.data = deepcopy(self.raw_data)
+        self.cells = self.data['cellList']
+        self.nets  = self.data['netList']
 
-    def _refresh_cache(self):
-        self.pos = []
-        self.rot = []
-        for cell in self.cell_list:
-            c = np.array(_safe_eval(cell["center"]), int)
-            r = int(cell.get("rotation","0"))
-            self.pos.append(c)
-            self.rot.append(r)
+        # 从第1个（索引1）开始放，索引0主芯片已固定
+        self.step_idx = 1
+        self.n_cells  = len(self.cells)
 
-    def _get_state(self):
-        # state 只返回当前 step_idx
+        # 占位矩阵
+        self.occupancy_grid = np.zeros((self.grid_size, self.grid_size), dtype=np.int8)
+
+        # 缓存
+        self.cell_centers   = []
+        self.cell_rotations = []
+        self.rel_contours   = []
+        self.pin_rel_pos    = {}
+
+        for idx, cell in enumerate(self.cells):
+            ctr    = np.array(safe_eval(cell['center']), dtype=int)
+            rot    = int(cell.get('rotation', '0'))
+            contour= np.array(safe_eval(cell['contour']), dtype=int)
+            rel_ct = contour - ctr
+
+            self.cell_centers.append(ctr)
+            self.cell_rotations.append(rot)
+            self.rel_contours.append(rel_ct)
+
+            for pin in cell['pinList']:
+                pc   = np.array(safe_eval(pin['center']), dtype=int)
+                self.pin_rel_pos[(cell['cellName'], pin['pinName'])] = pc - ctr
+
+        # 标记主芯片占位
+        self._update_occupancy(0, self.cell_centers[0], self.cell_rotations[0])
         return self.step_idx
 
-    def get_action_mask(self, rel_range=128, step=32):
-        """
-        只为当前器件(step_idx)生成合法 (dx,dy,rot_idx) 列表：
-        - 放置后不越界、不与任何已放置(0..step_idx-1)器件重叠。
-        """
-        if self.step_idx >= self.n_dev:
-            return []
+    def _rotate_points(self, pts: np.ndarray, angle: float) -> np.ndarray:
+        rad = np.deg2rad(angle)
+        R   = np.array([[np.cos(rad), -np.sin(rad)],
+                        [np.sin(rad),  np.cos(rad)]])
+        return pts @ R.T
 
-        idx = self.step_idx
-        main_c = self.pos[0]  # 主芯片坐标
-        mask = []
-        # dx, dy 枚举
-        rng = range(-rel_range, rel_range+1, step)
-        for rot_idx in range(4):
-            for dx in rng:
-                for dy in rng:
-                    new_c = main_c + np.array([dx,dy])
-                    if not (0 <= new_c[0] < self.grid_size and 0 <= new_c[1] < self.grid_size):
-                        continue
-                    if self._check_valid(idx, new_c, rot_idx):
-                        mask.append((dx, dy, rot_idx))
-        return mask
+    def _update_occupancy(self, idx: int, center: np.ndarray, rotation: float):
+        pts = (self._rotate_points(self.rel_contours[idx], rotation) + center).astype(np.int32)
+        cv2.fillPoly(self.occupancy_grid, [pts], -1)
 
-    def _check_valid(self, idx, new_c, rot_idx):
-        """
-        检查将 cell_list[idx] 放到 new_c 并旋转 rot_idx*90°
-        是否与已放置的 cell_list[0..step_idx-1] 重叠或越界。
-        """
-        cell = self.cell_list[idx]
-        c_old = self.pos[idx]
-        r_old = self.rot[idx]
-        contour0 = _safe_eval(cell["contour"])
-        # 计算新轮廓
-        new_pts = transform_shape(contour0, c_old, new_c, rot_idx*90 - r_old)
-        arr = np.array(new_pts, int)
-        # 越界检查
-        if (arr < 0).any() or (arr[:,0] >= self.grid_size).any() or (arr[:,1] >= self.grid_size).any():
-            return False
-        # 与已放置器件 AABB 重叠检查
-        x0,x1 = arr[:,0].min(), arr[:,0].max()
-        y0,y1 = arr[:,1].min(), arr[:,1].max()
-        for j in range(self.step_idx):
-            op = np.array(_safe_eval(self.cell_list[j]["contour"]), int)
-            ox0,ox1 = op[:,0].min(), op[:,0].max()
-            oy0,oy1 = op[:,1].min(), op[:,1].max()
-            if not (x1 < ox0 or ox1 < x0 or y1 < oy0 or oy1 < y0):
-                return False
-        return True
+    def _check_overlap(self, idx: int, center: np.ndarray, rotation: float) -> bool:
+        pts = (self._rotate_points(self.rel_contours[idx], rotation) + center).astype(np.int32)
+        # 越界
+        if np.any(pts < 0) or np.any(pts >= self.grid_size):
+            return True
+        # 与已占位区域重叠
+        tmp = np.zeros_like(self.occupancy_grid, dtype=np.uint8)
+        cv2.fillPoly(tmp, [pts], 1)
+        return np.any((tmp == 1) & (self.occupancy_grid == -1))
 
     def step(self, action):
-        dx, dy, rot_idx = action
-        idx = self.step_idx
-        cell = self.cell_list[idx]
+        """
+        action: (dx, dy, rot_idx)
+        如果 overlap 立即 reward=-1 并保持在同一个 step_idx，不前进；
+        否则放置、前进，最后一步完成后按综合成本给正 reward。
+        """
+        dx, dy, r_idx = action
+        idx     = self.step_idx
+        main_ctr= self.cell_centers[0]
+        rot     = [0,90,180,270][r_idx]
+        new_ctr = main_ctr + np.array([dx, dy])
 
-        main_c = self.pos[0]
-        new_c  = main_c + np.array([dx, dy])
-        # 更新 cell
-        cell["center"]   = str(new_c.tolist())
-        cell["rotation"] = str(rot_idx * 90)
+        # 若非法——重叠或越界，立即惩罚
+        if self._check_overlap(idx, new_ctr, rot):
+            return idx, -1.0, False, {}
 
-        # 更新轮廓 & pin
-        contour0 = _safe_eval(cell["contour"])
-        old_c, old_r = self.pos[idx], self.rot[idx]
-        new_contour = transform_shape(contour0, old_c, new_c, rot_idx*90 - old_r)
-        cell["contour"] = str(new_contour)
-        for pin in cell["pinList"]:
-            p0 = _safe_eval(pin.get("center", pin["contour"]))
-            new_pc = transform_shape([p0], old_c, new_c, rot_idx*90 - old_r)[0]
-            pin["center"]  = str(new_pc)
-            pin["contour"] = str(transform_shape(_safe_eval(pin["contour"]), old_c, new_c, rot_idx*90 - old_r))
+        # 合法——同步状态
+        self.cell_centers[idx]   = new_ctr
+        self.cell_rotations[idx] = rot
+        self._update_occupancy(idx, new_ctr, rot)
 
-        # 刷新缓存，步进
-        self._refresh_cache()
+        # 前进到下一个器件
         self.step_idx += 1
+        done = (self.step_idx >= self.n_cells)
 
-        # 只有最后一步给 reward
-        if self.step_idx < self.n_dev:
-            return self._get_state(), 0.0, False, {}
-        wl = self._compute_wl(self.gamma)
-        reward = 1.0 / (wl + 1e-6)
-        return self._get_state(), reward, True, {}
+        reward = 0.0
+        if done:
+            wl   = self._compute_wirelength()
+            nc   = self._compute_net_crossing()
+            den  = self._compute_density(self.density_grid_N)
+            cost = wl + self.nc_weight*nc + self.density_weight*den
+            reward = 1000.0 / (cost + 1e-6)
 
-    def _compute_wl(self, gamma):
-        total_wl = 0.0
-        for net in self.net_list:
+        return self.step_idx, reward, done, {}
+
+    def _compute_wirelength(self) -> float:
+        total = 0.0
+        for net in self.nets:
             xs, ys = [], []
-            for p in net["pinList"]:
-                # 找到 pin 的 center
-                for cell in self.cell_list:
-                    if cell["cellName"] == p["cellName"]:
-                        for pp in cell["pinList"]:
-                            if pp["pinName"] == p["pinName"]:
-                                xk, yk = map(float, _safe_eval(pp["center"]))
-                                xs.append(xk); ys.append(yk)
-                                break
-                        break
-            if not xs:
-                continue
-            xs, ys = np.array(xs), np.array(ys)
-            pos_x = np.log(np.exp(xs/gamma).sum() + 1e-12)
-            neg_x = np.log(np.exp(-xs/gamma).sum() + 1e-12)
-            pos_y = np.log(np.exp(ys/gamma).sum() + 1e-12)
-            neg_y = np.log(np.exp(-ys/gamma).sum() + 1e-12)
-            wl_e = gamma * (pos_x + neg_x + pos_y + neg_y)
-            total_wl += wl_e
-        return float(total_wl)
+            for p in net['pinList']:
+                cname, pname = p['cellName'], p['pinName']
+                i = next(i for i,c in enumerate(self.cells) if c['cellName']==cname)
+                ctr, rot = self.cell_centers[i], self.cell_rotations[i]
+                rel  = self.pin_rel_pos[(cname,pname)]
+                abs_ = ctr + self._rotate_points(rel, rot)
+                xs.append(abs_[0]); ys.append(abs_[1])
+            if xs:
+                xs, ys = np.array(xs), np.array(ys)
+                total += (xs.max()-xs.min()) + (ys.max()-ys.min())
+        return float(total)
+
+    def _compute_net_crossing(self) -> int:
+        segs = []
+        for net in self.nets:
+            pins = []
+            for p in net['pinList']:
+                cname, pname = p['cellName'], p['pinName']
+                i = next(i for i,c in enumerate(self.cells) if c['cellName']==cname)
+                ctr, rot = self.cell_centers[i], self.cell_rotations[i]
+                rel  = self.pin_rel_pos[(cname,pname)]
+                pins.append(tuple((ctr + self._rotate_points(rel, rot)).tolist()))
+            if len(pins) < 2: continue
+            src = pins[0]
+            for sink in pins[1:]:
+                segs.append((src, sink))
+
+        cnt = 0
+        for i in range(len(segs)):
+            for j in range(i+1, len(segs)):
+                if self._segments_cross(segs[i], segs[j]):
+                    cnt += 1
+        return cnt
+
+    def _segments_cross(self, s1, s2) -> bool:
+        def ccw(A,B,C):
+            return (C[1]-A[1])*(B[0]-A[0]) > (B[1]-A[1])*(C[0]-A[0])
+        A,B = s1; C,D = s2
+        return (ccw(A,C,D) != ccw(B,C,D)) and (ccw(A,B,C) != ccw(A,B,D))
+
+    def _compute_density(self, N: int) -> float:
+        grid = np.zeros((N,N), dtype=float)
+        unit = self.grid_size // N
+        mask = np.zeros((self.grid_size, self.grid_size), dtype=np.uint8)
+
+        # 合并所有已放器件到 mask 中
+        for idx in range(self.n_cells):
+            pts = (self._rotate_points(self.rel_contours[idx],
+                                       self.cell_rotations[idx])
+                   + self.cell_centers[idx]).astype(np.int32)
+            tmp = np.zeros_like(mask)
+            cv2.fillPoly(tmp, [pts], 1)
+            mask |= tmp
+
+        # 统计每个小格占用像素数
+        for i in range(N):
+            x0,x1 = i*unit, (i+1)*unit
+            for j in range(N):
+                y0,y1 = j*unit, (j+1)*unit
+                grid[i,j] = mask[x0:x1, y0:y1].sum()
+
+        mu = grid.mean()
+        return float(((grid - mu)**2).mean())
 
     def visualize(self):
         fig, ax = plt.subplots(figsize=(8,8))
-        for cell in self.cell_list:
-            pts = np.array(_safe_eval(cell["contour"]), int)
-            center = np.array(_safe_eval(cell["center"]), int)
-            real = pts + center
-            poly = plt.Polygon(real, fill=None, edgecolor='r')
-            ax.add_patch(poly)
-            ax.text(*center, cell["cellName"], ha='center')
-        # 画连线
-        for net in self.net_list:
-            coords = []
-            for p in net["pinList"]:
-                for cell in self.cell_list:
-                    if cell["cellName"] == p["cellName"]:
-                        for pp in cell["pinList"]:
-                            if pp["pinName"] == p["pinName"]:
-                                coords.append(np.array(_safe_eval(pp["center"]),int))
-                                break
-                        break
-            if len(coords)>=2:
-                xs = [c[0] for c in coords]
-                ys = [c[1] for c in coords]
-                ax.plot(xs, ys, '--', color='gray', alpha=0.7)
+        # 器件
+        for idx, cell in enumerate(self.cells):
+            pts = (self._rotate_points(self.rel_contours[idx],
+                                       self.cell_rotations[idx])
+                   + self.cell_centers[idx])
+            ax.add_patch(plt.Polygon(pts, fill=None, edgecolor='r'))
+            ax.text(*self.cell_centers[idx], cell['cellName'], ha='center')
+
+        # 飞线
+        for net in self.nets:
+            path = []
+            for p in net['pinList']:
+                cname, pname = p['cellName'], p['pinName']
+                i = next(i for i,c in enumerate(self.cells) if c['cellName']==cname)
+                ctr, rot = self.cell_centers[i], self.cell_rotations[i]
+                rel  = self.pin_rel_pos[(cname,pname)]
+                path.append(ctr + self._rotate_points(rel, rot))
+            path = np.array(path)
+            if len(path) > 1:
+                ax.plot(path[:,0], path[:,1], 'b-')
+
         ax.set_xlim(0, self.grid_size)
         ax.set_ylim(0, self.grid_size)
         ax.set_aspect('equal')
-        plt.title("PCB Layout with Wires")
+        plt.title("Final PCB Layout")
         plt.show()
-
-# ----- 搜索算法 -----
-
-def evaluate_sequence(pcb_json, seq, gamma=1.0):
-    env = PCBRLEnv(pcb_json, gamma)
-    env.reset()
-    r = 0.0
-    for act in seq:
-        _, r, done, _ = env.step(act)
-    return r
-
-def random_rollout(pcb_json, rel_range=128, step=32, gamma=1.0):
-    env = PCBRLEnv(pcb_json, gamma)
-    env.reset()
-    seq = []
-    n = env.n_dev
-    for _ in range(n):
-        mask = env.get_action_mask(rel_range, step)
-        act = random.choice(mask) if mask else (0,0,0)
-        seq.append(act)
-        env.step(act)
-    return seq, evaluate_sequence(pcb_json, seq, gamma)
-
-def greedy_improve(pcb_json, base_seq, rel_range=128, step=32,
-                   gamma=1.0, n_cand=10):
-    best = list(base_seq)
-    best_r = evaluate_sequence(pcb_json, best, gamma)
-    for i in range(len(best)):
-        # replay up to i
-        env = PCBRLEnv(pcb_json, gamma); env.reset()
-        for j in range(i):
-            env.step(best[j])
-        # mask for position i
-        mask = env.get_action_mask(rel_range, step)
-        local_best_r = best_r
-        local_best_act = best[i]
-        for _ in range(n_cand):
-            act = random.choice(mask) if mask else (0,0,0)
-            cand = best.copy(); cand[i] = act
-            r = evaluate_sequence(pcb_json, cand, gamma)
-            if r > local_best_r:
-                local_best_r = r
-                local_best_act = act
-        best[i] = local_best_act
-        best_r = local_best_r
-    return best, best_r
-
-def random_greedy_search(pcb_json, n_rollouts=20,
-                         rel_range=128, step=32, gamma=1.0):
-    best_seq, best_r = None, -1.0
-    for _ in range(n_rollouts):
-        seq, r = random_rollout(pcb_json, rel_range, step, gamma)
-        if r > best_r:
-            best_seq, best_r = seq, r
-    print(f"[Random]   best reward = {best_r:.6f}")
-    imp_seq, imp_r = greedy_improve(pcb_json, best_seq,
-                                    rel_range, step, gamma, n_cand=10)
-    print(f"[Greedy]   improved reward = {imp_r:.6f}")
-    return best_seq, best_r, imp_seq, imp_r
-
-def visualize_with_mask(pcb_json, seq, gamma=1.0):
-    env = PCBRLEnv(pcb_json, gamma)
-    env.reset()
-    for act in seq:
-        env.step(act)
-    env.visualize()
-
-if __name__ == "__main__":
-    pcb_json = "pcb_pre_jsons/pcb_cells_1.json"
-    best_seq, best_r, imp_seq, imp_r = random_greedy_search(
-        pcb_json, n_rollouts=50, rel_range=128, step=32, gamma=1.0
-    )
-    print("Best random seq:", best_seq)
-    print("Improved seq:",    imp_seq)
-    visualize_with_mask(pcb_json, imp_seq, gamma=1.0)
